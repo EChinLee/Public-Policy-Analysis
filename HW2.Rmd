@@ -1,0 +1,435 @@
+---
+title: 'Transit-Oriented Development'
+author: "E Chin Li"
+date: "09/19/2023"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: readable
+---
+# Preparation
+
+## Set Up
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+# Load Libraries
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(kableExtra)
+library(plotly)
+library(tmap)
+
+options(scipen=999)
+options(tigris_class = "sf")
+
+#Load qBr & q5 & theme & other source
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# Load color palette
+palette5 <- c("#f0f9e8","#bae4bc","#7bccc4","#43a2ca","#0868ac")
+
+# Census API Key
+census_api_key("ee5bb303d562a134a5fc2cdbc4ab53c8d0ca7629", overwrite = TRUE)
+```
+
+## Wrangling 2009 & 2017 ACS Data
+
+```{r include=TRUE, results="hide", message=FALSE, warning=FALSE}
+#2009data
+tracts09 <-  
+  get_acs(geography = "tract",
+          variables = c("B02001_001E", #total population
+                        "B19013_001E", #median HH income
+                        "B25058_001E", #median rent
+                        "B06012_002E", #total poverty
+                        "B25001_001E", #HH units number
+                        "B08301_001E", #total people commute
+                        "B08301_012E"), #total people commute by subway
+          year=2009, 
+          state= "DC",
+          geometry=TRUE,
+          output="wide") %>% 
+  st_transform('ESRI:102728') %>% 
+  rename(
+    TotalPop = B02001_001E,
+    MedHHInc = B19013_001E, 
+    MedRent = B25058_001E,
+    TotalPoverty = B06012_002E,
+    HHUnits = B25001_001E,
+    TotalCommute = B08301_001E,
+    SubwayCommute = B08301_012E
+  ) %>% 
+   mutate(pctRent = MedRent / MedHHInc *100,
+         perHHUnitPop = TotalPop / HHUnits,
+         pctPoverty = TotalPoverty / TotalPop*100,
+         pctSubwayCommute = SubwayCommute / TotalCommute*100,
+         year = "2009") %>%
+    dplyr::select(-NAME, -TotalPoverty, -TotalCommute, -SubwayCommute, -starts_with("B"))
+
+#2017data
+tracts17 <-  
+  get_acs(geography = "tract",
+          variables = c("B02001_001E", #total population
+                        "B19013_001E", #median HH income
+                        "B25058_001E", #median rent
+                        "B06012_002E", #total poverty
+                        "B25001_001E", #HH units number
+                        "B08301_001E", #total people commute
+                        "B08301_012E"), #total people commute by subway
+          year=2017, 
+          state= "DC",
+          geometry=TRUE,
+          output="wide") %>% 
+  st_transform('ESRI:102728') %>% 
+  rename(
+    TotalPop = B02001_001E,
+    MedHHInc = B19013_001E, 
+    MedRent = B25058_001E,
+    TotalPoverty = B06012_002E,
+    HHUnits = B25001_001E,
+    TotalCommute = B08301_001E,
+    SubwayCommute = B08301_012E
+  ) %>% 
+   mutate(pctRent = MedRent / MedHHInc *100,
+         perHHUnitPop = TotalPop / HHUnits,
+         pctPoverty = TotalPoverty / TotalPop*100,
+         pctSubwayCommute = SubwayCommute / TotalCommute*100,
+         year = "2017") %>%
+    dplyr::select(-NAME, -TotalPoverty, -TotalCommute, -SubwayCommute, -starts_with("B"))
+
+#combine 2009 & 2017
+allTracts <- rbind(tracts09,tracts17)
+```
+
+## Wrangling Subway Data
+
+```{r  include=TRUE, results="hide", message=FALSE, warning=FALSE}
+#Wrangling Subway Data
+metroStops <- st_read("https://raw.githubusercontent.com/EChinLee/MUSA508_Homework/HW2/Metro_Stations_in_DC.geojson")%>%
+  st_transform(st_crs(tracts09))
+
+  metroStops$line <- ifelse(metroStops$LINE=="red"|metroStops$LINE=="green"|metroStops$LINE=="orange",metroStops$LINE,"transfer station")
+
+ggplot() + 
+  geom_sf(data=st_union(tracts09)) +
+  geom_sf(data=metroStops, 
+          aes(colour = line), 
+          show.legend = "point", size= 2) +
+  scale_colour_manual(values = c("red" = "#8E2323", "green" = "#426F42", "orange" = "#E47833","transfer station" = "#4F2F4F")) +
+  labs(title="Metro Stops", 
+       subtitle="Washington DC", 
+       caption="Fig 1 (Source: opendata.dc.gov)") +
+  mapTheme()
+```
+
+## Create Buffer
+
+```{r  include=TRUE}
+#two kinds of buffer
+stopBuffer <- st_buffer(metroStops, 2640)
+
+stopUnion <- st_union(st_buffer(metroStops, 2640))
+
+metroBuffers <- 
+  rbind(
+     stopBuffer %>%
+      mutate(Legend = "Buffer") %>%
+      dplyr::select(Legend),
+     stopUnion %>%
+      st_sf() %>%
+      mutate(Legend = "Unioned Buffer"))
+
+#visualization buffers
+ggplot() +
+  geom_sf(data = metroBuffers) +
+  geom_sf(data = metroStops, show.legend = "point") +
+  facet_wrap(~Legend) + 
+  labs(caption = "Figure 2") +
+  mapTheme()
+```
+
+## Use Buffers to Visualize Spatial Population Data
+
+```{r  include=TRUE, warning=FALSE}
+# union buffer as filter
+buffer <- filter(metroBuffers, Legend=="Unioned Buffer")
+
+#clip
+clip <- 
+  st_intersection(buffer, tracts09) %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Clip")
+
+#spatial selection
+spatialselection <- 
+  tracts09[buffer,] %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Spatial Selection")
+
+#select by centroids
+selectCentroids <-
+  st_centroid(tracts09)[buffer,] %>%
+  st_drop_geometry() %>%
+  left_join(., dplyr::select(tracts09, GEOID), by = "GEOID") %>%
+  st_sf() %>%
+  dplyr::select(TotalPop) %>%
+  mutate(Selection_Type = "Select by Centroids")
+
+#Plotting the results of each method
+intersections <- rbind(clip, spatialselection, selectCentroids)
+
+ggplot() +
+  geom_sf(data=intersections, aes(fill = TotalPop)) +
+  geom_sf(data=metroStops, show.legend = "point") +
+  scale_fill_viridis_c() +
+  facet_wrap(~Selection_Type) + 
+  labs(caption = "Figure 3(Source: opendata.dc.gov)") +
+  mapTheme()
+```
+
+## Brief Introduction
+
+# TOD Indicators Analysis
+
+## TOD Indicators Visualizations
+
+```{r  include=TRUE, warning=FALSE}
+#indicator of TOD / Non-TOD
+allTracts.group <- 
+  rbind(
+    st_centroid(allTracts)[buffer,] %>%
+      st_drop_geometry() %>%
+      left_join(allTracts) %>%
+      st_sf() %>%
+      mutate(TOD = "TOD"),
+    st_centroid(allTracts)[buffer, op = st_disjoint] %>%
+      st_drop_geometry() %>%
+      left_join(allTracts) %>%
+      st_sf() %>%
+      mutate(TOD = "Non-TOD")) %>%
+  mutate(MedRent.inf = ifelse(year == "2009", MedRent * 1.14, MedRent)) 
+
+#plot TOD change
+ggplot() + 
+  geom_sf(data = st_union(tracts09)) +
+  geom_sf(data = allTracts.group,
+          aes(fill = TOD)) +
+  labs(title="2009 & 2017 TOD Distribution", 
+       subtitle="Washington DC", 
+       caption="Fig 4(Source: opendata.dc.gov)") +
+  scale_fill_manual(values = c("TOD" = "#FEB35E", "Non-TOD" = "#81B2D4") ) +
+  facet_wrap(~year)+
+  #scale_colour_manual(values = c("TOD" = "#FEB35E", "Non-TOD" = "#81B2D4") ) +
+  mapTheme()
+
+#% of Income spent on Rent visualization
+ggplot() + 
+  geom_sf(data = st_union(tracts09)) +
+  geom_sf(data = allTracts.group,
+          aes(fill = q5(pctRent)
+              ) )+
+  geom_sf(data = buffer, fill = "transparent", color = "red") +
+  labs(title="2009 & 2017 Percentage of Household Income Spent on Rent", 
+       subtitle="Washington DC", 
+       caption="Fig 5(Source: opendata.dc.gov)") +
+  facet_wrap(~year)+
+  scale_fill_manual(values = palette5 ) +
+  mapTheme()
+
+#People per Housing Unit visualization
+ggplot() + 
+  geom_sf(data = st_union(tracts09)) +
+  geom_sf(data = allTracts.group,
+          aes(fill = q5(perHHUnitPop)
+              ) )+
+  geom_sf(data = buffer, fill = "transparent", color = "red") +
+  labs(title="2009 & 2017 People per Household Unit", 
+       subtitle="Washington DC", 
+       caption="Fig 6(Source: opendata.dc.gov)") +
+  facet_wrap(~year)+
+  scale_fill_manual(values = palette5 ) +
+  mapTheme()
+
+#poverty percentage visualization
+ggplot() + 
+  geom_sf(data = st_union(tracts09)) +
+  geom_sf(data = allTracts.group,
+          aes(fill = q5(pctPoverty)
+              ) )+
+  geom_sf(data = buffer, fill = "transparent", color = "red") +
+  labs(title="2009 & 2017 Percentage of Poverty", 
+       subtitle="Washington DC", 
+       caption="Fig 7(Source: opendata.dc.gov)") +
+  facet_wrap(~year)+
+  scale_fill_manual(values = palette5 ) +
+  mapTheme()
+
+#% of subway commute in total visualization
+ggplot() + 
+  geom_sf(data = st_union(tracts09)) +
+  geom_sf(data = allTracts.group,
+          aes(fill = q5(pctSubwayCommute)) )+
+  geom_sf(data = buffer, fill = "transparent", color = "red") +
+  labs(title="2009 & 2017 Percentage of Subway in Total Commute Means", 
+       subtitle="Washington DC", 
+       caption="Fig 8(Source: opendata.dc.gov)") +
+  facet_wrap(~year)+
+  scale_fill_manual(values = palette5 ) +
+  mapTheme()
+```
+
+## TOD Indicator Tables
+
+```{r  include=TRUE, warning=FALSE}
+# TOD Indicator Tables years & TOD
+allTracts.Summary <- 
+  st_drop_geometry(allTracts.group) %>%
+  group_by(year, TOD) %>%
+  summarize(Rent = mean(MedRent, na.rm = T),
+            Population = mean(TotalPop, na.rm = T),
+            Percent_Income_on_Rent = mean(pctRent, na.rm = T),
+            People_per_Household_Unit = mean(perHHUnitPop, na.rm = T),
+            Percent_Poverty = mean(pctPoverty, na.rm = T),
+            Percent_Subway_in_Commute = mean(pctSubwayCommute, na.rm = T))
+
+kable(allTracts.Summary) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed") )%>%
+  footnote(general_title = "\n",
+           general = "Table 1(Source: opendata.dc.gov)")
+
+# TOD Indicator Tables Variables
+allTracts.Summary %>%
+  unite(year.TOD, year, TOD, sep = ": ", remove = T) %>%
+  gather(Variable, Value, -year.TOD) %>%
+  mutate(Value = round(Value, 2)) %>%
+  spread(year.TOD, Value) %>%
+  kable() %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general_title = "\n",
+           general = "Table 2(Source: opendata.dc.gov)")
+```
+
+## TOD Indicator Plots
+
+```{r  include=TRUE, warning=FALSE}
+# TOD Indicator four visualization Plots
+allTracts.Summary %>%
+  gather(Variable, Value, -year, -TOD) %>%
+  ggplot(aes(year, Value, fill = TOD)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Variable, scales = "free", ncol=5) +
+  scale_fill_manual(values = c("#bae4bc", "#0868ac")) +
+  labs(title = "Indicator differences across time and space",
+       subtitle="Washington DC", 
+       caption="Fig 9(Source: opendata.dc.gov)") +
+  plotTheme() + theme(legend.position="bottom")
+```
+
+## Graduated Symbol Maps of Population and Rent within 0.5 mile of each Transit Station
+
+```{r  include=TRUE, warning=FALSE}
+# change geometry into x & y
+metroStopscoord <- metroStops %>% 
+                  st_transform(st_crs('ESRI:102728')) %>% 
+                  dplyr::mutate(x = sf::st_coordinates(.)[,1], 
+                                y = sf::st_coordinates(.)[,2]) %>%
+                  distinct(NAME, .keep_all=TRUE) %>%
+                  dplyr::select(-LINE, -line)
+
+#add x & y to the orginal data forming new data
+new_allTracts.group <- allTracts.group %>% st_join(metroStopscoord)
+
+#graduated symbol maps of population
+ggplot() +
+  geom_sf(data = new_allTracts.group, alpha = 0.4) +
+  geom_point(data = new_allTracts.group, aes(x = x, y = y, size = TotalPop, color = "red"), alpha = 0.5) +
+  scale_size_area(max_size = 15) + #size change
+  #scale_color_gradient(low = "blue", high = "red") +  # color change
+  geom_sf(data = metroStops, size = 1, color = "black") + #station point
+  labs(title = "Population within 0.5 mi. of Subway Stations", 
+       subtitle = "Washington, DC", 
+       caption = "Fig 10(Source: US Census Bureau; opendata.dc.gov)") +
+  facet_wrap(~year) +
+  mapTheme()
+
+#graduated symbol maps of rent
+ggplot() +
+  geom_sf(data = new_allTracts.group, alpha = 0.4) +
+  geom_point(data = new_allTracts.group, aes(x = x, y = y, size = MedRent, color = "red"), alpha = 0.5) +
+  scale_size_area(max_size = 15) + #size change
+  #scale_color_gradient(low = "blue", high = "red") +  # color change
+  geom_sf(data = metroStops, size = 1, color = "black") + #station point
+  labs(title = "Rent within 0.5 mi. of Subway Stations", 
+       subtitle = "Washington, DC", 
+       caption = "Fig 11(Source: US Census Bureau; opendata.dc.gov)") +
+  facet_wrap(~year) +
+  mapTheme()
+
+#or show the population & rent in one graduated symbol
+ggplot() +
+  geom_sf(data = new_allTracts.group, alpha = 0.4) +
+  geom_point(data = new_allTracts.group, aes(x = x, y = y, size = TotalPop, color = MedRent), alpha = 0.5) +
+  scale_size_area(max_size = 15) + #size change
+  scale_color_gradient(low = "blue", high = "red") +  # color change
+  geom_sf(data = metroStops, size = 1, color = "black") + #station point
+  labs(title = "Population and Rent within 0.5 mi. of Subway Stations", 
+       subtitle = "Washington, DC", 
+       caption = "Fig 12(Source: US Census Bureau; opendata.dc.gov)") +
+  facet_wrap(~year) +
+  mapTheme()
+```
+
+## Geomline Plot Shows Mean Rent as a Function of Distance to Transit Stations
+
+```{r  include=TRUE, warning=FALSE}
+allTracts <- rbind(tracts17,tracts09)
+metro_MRB <- multipleRingBuffer(st_union(metroStops), 47520, 2640)
+
+allTracts.rings <-
+  st_join(st_centroid(dplyr::select(allTracts, GEOID, year)),
+          metro_MRB) %>%
+  st_drop_geometry() %>%
+  left_join(dplyr::select(allTracts, GEOID, MedRent, year), 
+            by=c("GEOID"="GEOID", "year"="year")) %>%
+  st_sf() %>%
+  mutate(distance = distance / 5280) #convert to miles
+
+#multipleRingBuffer visualization
+  ggplot() +
+    geom_sf(data=metro_MRB) +
+    geom_sf(data=metroStops, size=1) +
+    geom_sf(data=st_union(tracts17), fill=NA, size=1.2) +
+    labs(title="Half mile buffers",
+         subtitle="Washington DC", 
+       caption="Fig 13(Source: opendata.dc.gov)") +
+    mapTheme()
+
+ allTracts.rings.summary <- st_drop_geometry(allTracts.rings) %>%
+    group_by(distance, year) %>%
+    summarize(Mean_Rent = mean(MedRent, na.rm=TRUE))
+
+#geom_line plot
+ggplot(allTracts.rings.summary,
+       aes(distance, Mean_Rent, colour=year)) +
+      geom_point(size=3) + 
+  geom_line(size=2) +
+  labs(title="Mean Rent as a Function of Distance to Transit Station",
+         subtitle="Washington DC", 
+       caption="Fig 14(Source: US Census Bureau; opendata.dc.gov)") 
+```
+
+# Conclusion
+
+## Household Preferences for Transit-Rich Neighborhoods
+
+## Economic Shift Influenced by Population in TODs
+
+## Spatial Biases and Margin of Error
