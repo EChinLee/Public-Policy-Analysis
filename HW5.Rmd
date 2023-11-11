@@ -1,0 +1,506 @@
+---
+title: "Targeting A Housing Subsidy"
+author: "E Chin Li"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+    code_download: yes
+---
+# Introduction
+
+## Background
+
+The cost-benefit analysis stems from our recognition of the inefficiency in the current approach to home repair tax credit program. Despite proactive outreach to eligible homeowners, the uptake of the credit is disappointingly low. This situation has prompted us to seek a more data-driven and targeted strategy for allocating the limited outreach resources. By leveraging historical data and building a predictive model that can identify homeowners likely to benefit from the program, we can enhance the cost-effectiveness of our outreach efforts and increase the number of eligible homeowners who actually benefit from the tax credit. This cost-benefit analysis aims to **help Emil City's HCD office transform the existing outreach process from a random approach to a more targeted and intentional program**, thus improve the allocation of resources and increasing the positive impact of the program on homeowners and the community.
+
+## Set Up & Data Loading
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loaddata, message=FALSE, warning=FALSE}
+options(scipen=10000000)
+
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(lubridate)
+library(scales)
+library(stargazer)
+library(gridExtra)
+library(patchwork)
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+palette5 <- c("#FA8072","#FFA07A","#FFB6C1","#D8BFD8","#9370DB")
+palette4 <- c("#FA8072","#FFB6C1","#D8BFD8","#9370DB")
+palette2 <- c("#FA8072","#D8BFD8")
+
+data <- read.csv("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/Chapter6/housingSubsidy.csv") %>% na.omit() 
+
+```
+
+# Feature Analysis
+
+## Feature Visualizations
+
+Data visualizations display the characteristic differences of the homeowners who choose to enroll the program or not. Features are described as continuous, yes/no, or multiple category.
+
+### Continuous Features
+
+Notably, there are three significant characteristics of continuous features. Firstly, times of contacts before this campaign for each individual show much differences in enrollment results. It's suggested that the more times an individual has been contacted, the more likely this individual would use the tax credit program. Besides, homeowners are more likely to accept tax credit when the inflation rate is low, which indicates this welfare program may be more welcomed during economic upswing period. Additionally, it can be seen clearly that homeowners tend to accept the tax credit when the unemployment rate is higher. This suggests an interesting fact seems to conflict against the former finding: individuals prefer reaching out for external resources in times of national economic distress.
+
+```{r continuous_features, fig.height=8, fig.width=11, message=FALSE, warning=FALSE}
+data %>%
+  dplyr::select(y, age, previous, unemploy_rate, cons.price.idx, cons.conf.idx, inflation_rate, spent_on_repairs) %>%
+  gather(Variable, value, -y) %>%
+  ggplot(aes(y, value, fill=y)) + 
+    geom_bar(position = "dodge", stat = "summary", fun = "mean") + 
+    facet_wrap(~ Variable, scales = "free", ncol = 4,  labeller= labeller(Variable = c(
+    `age` = "age",
+    `previous` = "previous",
+    `unemploy_rate` = "unemploy %",
+    `cons.price.idx` = "CPI",
+    `cons.conf.idx` = "CCI",
+    `inflation_rate` = "inflation rate",
+    `spent_on_repairs` = "repairs fee"))) +
+    scale_fill_manual(values = palette2) +
+    labs(x="CreditTake", y="Mean", 
+         title = "Fig 1: Feature associations with the likelihood of churn",
+         subtitle = "(Continous outcomes)") +
+    plotTheme() + theme(legend.position = "none")
+```
+
+### Yes/No Features
+
+Mortgage condition and residence status are contained in the yes/no features description. Homeowners without mortgage tend to take tax credit than those who carry mortgage, indicating that individuals with less economic burden on housing are more willing to participate in this campaign. This is also true for taxpayer in Philadelphia: compared to homeowners whose full time residence is not in Philadelphia, local taxpayers show stronger interests in using the tax credit.
+
+```{r YN_features, fig.height=4, fig.width=8}
+data %>%
+  dplyr::select(y, mortgage, taxbill_in_phl) %>%
+  gather(Variable, value, -y) %>%
+  count(Variable, value, y) %>%
+  filter(value == "yes") %>%
+    ggplot(aes(y, n, fill = y)) +   
+      geom_bar(position = "dodge", stat="identity") +
+      facet_wrap(~Variable, scales = "free", ncol = 4, labeller= labeller(Variable = c(
+    `mortgage` = "mortgage",
+    `taxbill_in_phl` = "residence"))) +
+      scale_fill_manual(values = palette2) +
+      labs(x="CreditTake", y="Count",
+           title = "Fig 2: Feature associations with the likelihood of churn",
+           subtitle = "Category features (Yes and No)") +
+      plotTheme() + theme(legend.position = "none")
+```
+
+### Category Features
+
+Many multiple category features do not show significant difference, day of the week HDC last contacted individual etc. However, it can be deduced from the plot below that individuals working in administration/ are married/ contacted through cellular rather than telephone, are more likely to take advantage of the tax credit. Additionally, a surprising finding worth taking note of is that, the number of contacts for an individual within the duration tax credit program shows, the more times an individual has been contacted, they are more likely to not use the tax credit program. 
+
+```{r category_features, fig.height=8, fig.width=11 }
+data %>%
+  dplyr::select(y, job, marital, education, contact, month, day_of_week, campaign, pdays, poutcome) %>%
+  gather(Variable, value, -y) %>%
+  count(Variable, value, y) %>%
+  ggplot(aes(value, n, fill = y)) +   
+    geom_bar(position = "dodge", stat="identity") +
+    facet_wrap(~Variable, scales = "free",ncol = 3, labeller = labeller(Variable = c(
+    `job` = "job",
+    `marital` = "marital",
+    `education` = "education",
+    `contact` = "contact",
+    `month` = "month",
+    `day_of_week` = "day",
+    `campaign` = "campaign",
+    `pdays` = "pdays",
+    `poutcome` = "previous outcome"))) +
+    scale_fill_manual(values = palette2) +
+    labs(x="CreditTake", y="Count",
+         title = "Fig 3: Feature associations with the likelihood of churn",
+         subtitle = "Category features") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Feature Engineering
+
+Based on the feature visualizations, some new features are engineered in order to optimize the generalizability and precision of the model. The new features include age groups, education background, employment status, season, and previous contact interval. Following are the details:
+
+- Age group: ages have been consolidated to get generational groups, which named *early adulthood*, *middle adulthood*, and *old age*. The classification criteria is from [ScienceDirect](https://www.sciencedirect.com/topics/computer-science/chronological-age#:~:text=Adulthood%20is%20usually%20divided%20into,of%20age%20are%20also%20important).
+
+- Education background: levels of education have been changed to three kinds. *High* includes individuals who have attained university or professional degree. Illiterate and unknown individuals are reclassified as *illiterate*. Others who get equivalent or less than high school diploma are grouped as *low*.
+
+- Employment status: this feature reclassifies job data to determine if someone is a *student*, *self-employed*, *employed*, or *unemployed*. Notably, unknown individuals have been classified as "unemployed".
+
+- Season: months have been categorized into the season they fall into, *winter*, *spring*, *summer*, and *fall*. 
+
+- Previous contact interval: the number of days since a homeowner used a previous program are reconstructed, using *never*, *one week*, *one month*, and *more than one month* instead of days.
+
+```{r feature_engineering}
+housing <-
+  data %>%
+  filter(taxLien != "yes") %>% 
+  mutate(
+    #age
+    Age = case_when(
+      age >= 18 & age < 40 ~ "early adulthood",
+      age >= 39 & age < 60 ~ "middle adulthood",
+      age >= 60 ~ "old age"),
+    #season
+    Season = case_when(
+      month == "dec" |month == "jan" | month == "feb" ~ "winter",
+      month == "mar" |month == "apr" | month == "may" ~ "spring",
+      month == "jun" |month == "jul" | month == "aug" ~ "summer",
+      month == "sep" |month == "oct" | month == "nov" ~ "fall"),
+    #education
+    Education = case_when(
+      education == "university.degree" | education == "professional.course" ~ "high",
+      education == "illiterate" | education == "unknown" ~ "illiterate",
+      TRUE ~ "low"),
+    #pdays
+    PreContact = case_when(
+      pdays == 999 ~ "never",
+      pdays < 8 ~ "one week",
+      pdays >= 8 & pdays < 31 ~ "one Month", 
+      TRUE ~ "more than one Month"),
+    #job
+    Employ = case_when(
+      job =="self-employed" ~ "self-employed",
+      job == "student" ~ "student",
+      job =="unemployed" | job =="unknown" ~ "unemployed",
+      TRUE ~ "employed"))
+colnames(housing)[colnames(housing) == "taxbill_in_phl"] <- "Residence"
+#table(data$pdays)
+```
+
+# Logistic Regression
+
+## Dataset Split
+
+Dataset is split into a 65/35 training/test set for model test.
+
+```{r split_traning_set}
+set.seed(748)
+trainIndex <- createDataPartition(housing$y, p = .65,
+                                  list = FALSE,
+                                  times = 1)
+housingTrain <- housing[ trainIndex,]
+housingTest  <- housing[-trainIndex,]
+```
+
+## Model Fitting
+
+We run two different regression models to get a kitchen sink and feature engineered model. The kitchen sink is essentially a model that has all of the original data while taking out the engineered features. The feature engineered model is a model that filters out some irrelevant features, includes the features we have manipulated, and extracts the original data from which it was created.
+
+### Kitchen Sink Model
+
+The kitchen sink model shows a bunch of features have significant relevance to tax credit taking. Age of homeowner, month HDC last contacted the individual, and times of contacts for the campaign all show statistic significance on the 99% level (P < 0.01). Days after the last contact from a previous program, unemployment rate, consumer price index, and consumer confidence index show statistic significance on the 95% level (P < 0.05). Previous contact approach shows statistic significance on the 99.9% level (P < 0.001).
+
+```{r reg_kitchen_sink}
+reg_kitchen_sink <- glm(y_numeric ~ .,
+                  data = housingTrain %>% 
+                  dplyr::select(-Age, -Season, -Employ, -Education, -PreContact, -X, -y),
+                  family="binomial" (link="logit"))
+summary(reg_kitchen_sink)
+```
+
+### Engineered Model
+
+Compared to the kitchen sink model, the feature engineered model contains new engineered features constructed above, and filters out some unimportant features, such as day of the week HDC last contacted individual, or inflation rate. Previous contact approach still shows statistic significance on the 99.9% level (P < 0.001), and also as age of homeowner and times of contacts for the campaign, which show statistic significance on the 99% level (P < 0.01). Besides, only days after the last contact from a previous program, consumer price index, and consumer confidence index still show statistic significance on the 95% level (P < 0.05).
+
+```{r engineered_regression}
+reg_engineered <- glm(y_numeric ~ .,
+                  data=housingTrain %>% 
+                  dplyr::select(-age, -month, -education, -pdays, -job, -taxLien, -day_of_week, -inflation_rate, -X, -y),
+                  family="binomial" (link="logit"))
+
+summary(reg_engineered)
+```
+
+# Goodness of Fit
+
+## Regression Comparison
+
+In the kitchen sink model, we get a McFadden score of 0.237 and a score of 0.214 for our feature engineered model. The McFadden score is a metric of goodness for fit. Following these regressions, the kitchen sink model has a better fit than our engineered model. In efforts to improve this model and achieve a higher McFadden score, the model has undergone a number of trials. The original kitchen sink model still received the highest McFadden score. However to test the capacity of our model, the feature engineered model is used in further analysis to test its power considering the McFadden score is not extremely different from the kitchen sink model.
+
+```{r stargazer_comparison, message=FALSE, warning=FALSE}
+stargazer(reg_kitchen_sink, reg_engineered, title = "Table 1: Regression Model Comparison", type = "text")
+```
+
+```{r McFadden, message=FALSE, warning=FALSE}
+pR2(reg_kitchen_sink)[4]
+pR2(reg_engineered)[4]
+```
+
+## Prediction Probability Visualization & Comparison
+
+Following plots compare the predictions of taking the tax credit. A negative or 0 value means that homeowners did not use the tax credit, while a positive or 1 value means that they did use the tax credit. Strong models will have a peak closer to 0 for the negatives (no tax credit), and a peak closer to 1 for the positives (tax credit). In this figure we can see that both models have very slight difference, and our model is better at predicting the negatives rather than the positives. However it is worth mentioning that although both positive peaks are closer to 0, the positive values of feature engineered model still have a considerably thick density closer to 1.
+
+```{r predict_probs_visualization, fig.height=4, fig.width=11}
+testProbs_ks <- data.frame(Outcome = as.factor(housingTest$y_numeric),
+                        Probs = predict(reg_kitchen_sink, housingTest, type="response"))
+
+RegKitchenSink <- ggplot(testProbs_ks, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) + xlim(0, 1) +
+  labs(x = "CreditTake probability", y = "Density of probabilities") +
+  plotTheme() + theme(strip.text.x = element_text(size = 8),
+        legend.position = "none")
+
+
+testProbs <- data.frame(Outcome = as.factor(housingTest$y_numeric),
+                        Probs = predict(reg_engineered, housingTest, type="response"))
+
+RegEngineered <- ggplot(testProbs, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) + xlim(0, 1) +
+  labs(x = "CreditTake probability", y = "Density of probabilities") +
+  plotTheme() + theme(strip.text.x = element_text(size = 8),
+        legend.position = "none")
+
+grid.arrange(RegKitchenSink, RegEngineered, ncol = 2, top = "Fig 4: Distribution of predicted probabilities by observed outcome")
+```
+
+## Confusion Matrix Comparison
+
+The confusion matrix shows the number of observed instances of using the tax credit that are predicted as such. Each entry in the matrix provides a different comparison between observed and predicted, given the 50% threshold.
+
+For the kitchen sink model, there are 38 true positives, 119 false positives, 1256 true negatives, and 27 false negatives. The overall accuracy is nearly 90.0%, indicates a good result. The sensitivity and specificity is respectively 24.2% and 97.9%, meaning that the model is better at predicting those who are not going to take tax credit than those who will. 
+
+For the feature engineered model, there are 34 true positives, 123 false positives, 1263 true negatives, and 20 false negatives. The overall accuracy is nearly 90.1%, indicates a good result as the kitchen sink model. The sensitivity and specificity is respectively 21.7% and 98.4%, showing the model is even more better at predicting those who are not going to take tax credit than kitchen sink model.
+
+```{r threshold_classify}
+testProbs_ks <- 
+  testProbs_ks %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs_ks$Probs > 0.5 , 1, 0)))
+
+caret::confusionMatrix(testProbs_ks$predOutcome, testProbs_ks$Outcome, 
+                       positive = "1")
+
+testProbs <- 
+  testProbs %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs$Probs > 0.5 , 1, 0)))
+
+caret::confusionMatrix(testProbs$predOutcome, testProbs$Outcome, 
+                       positive = "1")
+```
+
+## ROC Curve & AUC Comparison
+
+Both curves are above the diagonal line, indicating that both models are performing better than random chance. Also, the curves are quite far from the diagonal, indicating good models. Additionally, the AUC curve is 0.756 for feature engineered model, proposing that we have a strong model with the feature engineered variables.
+
+```{r Roc_Curves, fig.height=4, fig.width=11, message=FALSE, warning=FALSE}
+RegKitchenSink <- ggplot(testProbs_ks, aes(d = as.numeric(testProbs_ks$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FA8072") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = '#D8BFD8') +
+  labs(title = "Kitchen Sink Model")
+
+RegEngineered <- ggplot(testProbs, aes(d = as.numeric(testProbs$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FA8072") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = '#D8BFD8') +
+  labs(title = "Feature Engineering Model")
+
+grid.arrange(RegKitchenSink, RegEngineered, ncol = 2, top = "Fig 5: ROC Curve")
+
+auc_ks <- pROC::auc(testProbs_ks$Outcome, testProbs_ks$Probs)
+auc_engineered <- pROC::auc(testProbs$Outcome, testProbs$Probs)
+
+auc_table <- data.frame(
+  "Kitchen Sink Model" = auc_ks,
+  "Feature Engineering Model" = auc_engineered)
+
+kable(auc_table, caption = "AUC Comparison") %>% 
+  kable_styling( bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general_title = "\n", general = "Table 1")
+```
+
+## Cross Validation Comparison
+
+Based on cross validation tool that uses 100 folds, the ROC, sensitivity, and specificity of both the engineered and kitchen sink models are plotted. In each calculation, the model is generalizable if it is tight around the mean. The ROC for the kitchen sink is slightly better as the distributions are tighter around the mean as compared to the feature engineered model. However in both models, the sensitivity is almost perfect, meaning that both models are better at predicting true positives rather than false positives. We can also see that in both models our specificity for both models is almost the same and both relatively low, meaning that both models are not as good in predicting true negatives.
+
+```{r cross_validation, fig.width= 11, message=FALSE, warning=FALSE}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+cvFit_ks <- train(y ~ ., data = housing %>% 
+                dplyr::select(-Age, -Season, -Education, -PreContact, -Employ, -X, -y_numeric),
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+cvFit_engineered <- train(y ~ ., data = housing %>% 
+                dplyr::select(-age, -month, -education, -pdays, -job, -X, -y_numeric),
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+RegKitchenSink <- dplyr::select(cvFit_ks$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit_ks$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#D8BFD8") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#FA8072", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x="Goodness of Fit", y="Count", title="Fig 6: Kitchen sink model") +
+    plotTheme()
+
+RegEngineered <- dplyr::select(cvFit_engineered$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit_engineered$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#D8BFD8") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#FA8072", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x="Goodness of Fit", y="Count", title="Fig 7: Feature engineering model") +
+    plotTheme()
+
+RegKitchenSink / RegEngineered
+```
+
+# Costs & Benefits Analysis
+
+## Calculation Summary
+
+Creating a cost-benefit analysis allows us to optimize our resource allocation and ensure we are impacting the most amount of people with the limited resources we have for a more directed campaign. In creating the cost benefit calculation, we have the following assumptions:
+
+- Marketing resources: **$2,850**.
+
+- Credit costs: **$5,000**.
+
+- Sale premium: **$10,000**.
+
+- Surrounding premium: **$56,000**.
+
+- **25%** achieved the credit.
+
+With these assumptions, we formulate mathematical equations to get our calculations:
+
+- True Positive: **$(-2,850 -5,000 +10,000 +56,000 ) * 0.25 * count + (-2850) * 0.75 * count**. We allocate marketing resources to homeowners, and 25% of homeowners took the credit.
+
+- True Negative: **$0**. We predict they would not take the credit, and as a result no marketing or credit is allocated.
+
+- False Positive: **$-2,850**. Marketing resources are allocated but no credit.
+
+- False Negative: **$0**. We predict homeowners would not take credit but they do.
+
+Based on these data, we can calculate that:
+
+- Benefit when algorithm used: 421600 - 57000 = **$364600**
+
+- Benefit when no algorithm used: (34 + 20) * 2850 = **$153900**
+
+- Algorithm bring more benefit: 364600 - 153900 = **$210700**
+
+```{r cost_benefit}
+cost_benefit_table <-
+   testProbs %>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+                True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+                False_Negative = sum(n[predOutcome==0 & Outcome==1]),
+                False_Positive = sum(n[predOutcome==1 & Outcome==0])) %>%
+       gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(Variable == "True_Negative"  ~ 0,
+                         Variable == "True_Positive"  ~ (58150 * (Count * .25)) + 
+                                                        (-2850 * (Count * .75)),
+                         Variable == "False_Negative" ~ 0,
+                         Variable == "False_Positive" ~ -2850 * Count)) %>%
+    bind_cols(data.frame(Description = c(
+              "Predicted correctly homeowner would not take the credit, no marketing resources were allocated, and no credit was allocated",
+              "Predicted correctly homeowner would enter credit program; allocated the marketing resources, and 25% ultimately achieved the credit",
+              "We predicted that a homeowner would not take the credit but they did",
+              "Predicted incorrectly homeowner would take the credit; allocated marketing resources; no credit allocated")))
+
+kable(cost_benefit_table) %>% 
+  kable_styling( bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general_title = "\n", general = "Table 2")
+```
+
+Using an iterate threshold, we are able to achieve a confusion matrix that visualizes the venue by threshold as seen in following figure. Approximately around threshold 0.17, the revenue begins to normalize and flattens out. It is important to note that most money was spent on the false positive groups. A sum of money is also spent on true positives, however their costs are offset by the impact of the tax credit program.
+
+```{r confusion_metric_for_Threshold, fig.height=8, fig.width=11}
+whichThreshold <- 
+  iterateThresholds(
+     data=testProbs, observedClass = Outcome, predictedProbs = Probs)
+
+whichThreshold <- 
+  whichThreshold %>%
+    dplyr::select(starts_with("Count"), Threshold) %>%
+    gather(Variable, Count, -Threshold) %>%
+    mutate(Revenue =
+             case_when(Variable == "Count_TN"  ~ 0,
+                       Variable == "Count_TP"  ~ (58150 * (Count * .25)) + (-2850 * (Count * .75)),
+                       Variable == "Count_FN"  ~ 0,
+                       Variable == "Count_FP"  ~ -2850 * Count))
+
+whichThreshold %>%
+  ggplot(.,aes(Threshold, Revenue, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = palette5[c(5, 1:3)]) +    
+  labs(title = "Fig 8: Revenue by confusion matrix type and threshold",
+       y = "Revenue") +
+  plotTheme() +
+  guides(colour=guide_legend(title = "Confusion Matrix")) 
+```
+
+## Optimizing Threshold
+
+As seen in the previous and following figure, revenue begins to normalize or flatten out at 0.17, thus **0.17** is the best threshold. This means that if as a department we want to maximize our budget, we should only allocate to those in the thresholds between 0.17 to 1.
+
+```{r Threshold_function_of_TotRev_and_TotCountCred, fig.height=8, fig.width=11, message=FALSE, warning=FALSE}
+whichThreshold_revenue <- 
+  whichThreshold %>% 
+    mutate(actualCreditTake = ifelse(Variable == "Count_TP", (Count * .25),
+                         ifelse(Variable == "Count_FN", Count, 0))) %>% 
+    group_by(Threshold) %>% 
+    summarize(Total_Revenue = sum(Revenue),
+              Total_Count_Of_Credits = sum(actualCreditTake)) 
+
+grid.arrange(ncol = 1,
+ggplot(whichThreshold_revenue)+ 
+  geom_line(aes(x = Threshold, y = Total_Revenue, size = "Line_Size_Variable"), color = "#FA8072")+
+  geom_vline(xintercept =  pull(arrange(whichThreshold_revenue, -Total_Revenue)[1,1]))+
+  scale_size_manual(values = c("Line_Size_Variable" = 1.5)) +
+    labs(title = "Fig 9: Total Revenues By Threshold",
+         subtitle = "Vertical Line Denotes Optimal Threshold") + guides(size = FALSE),
+
+ggplot(whichThreshold_revenue)+ 
+  geom_line(aes(x = Threshold, y = Total_Count_Of_Credits, size = "Line_Size_Variable"), color = "#9370DB")+
+  geom_vline(xintercept =  pull(arrange(whichThreshold_revenue, -Total_Count_Of_Credits)[1,1])) +
+  scale_size_manual(values = c("Line_Size_Variable" = 1.5)) +
+    labs(title = "Fig 10: Total Count of Credits By Threshold",
+         subtitle = "Vertical Line Denotes Optimal Threshold") + guides(size = FALSE)) 
+
+```
+
+```{r Benefit_by_Threshold }
+ThresholdTable <-
+  whichThreshold_revenue %>%
+  dplyr::select(Threshold, Total_Revenue, Total_Count_Of_Credits) %>%
+  filter(Threshold == 0.17 | Threshold == 0.50)
+
+kable(ThresholdTable, caption = "Benefit by Threshold") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general_title = "\n", general = "Table 3")
+
+```
+
+# Conclusion
+
+Generally, features of homeowners are examined and used in the logistic regression model to reveal the relationship between homeowner features and their tax credit taking probability. Although the predictions made by the model isn't precise enough in true negatives, this projection is highly successful in capturing the true positives, or the homeowners who we predict won't take the credit and actually don't take, thus can still explain the current credit taking pattern to some extent. 
+
+However, I will probably not recommend the regression model to HCD for practical use. Firstly, taking the future prediction as an example, the performance of this regression model is not ideal in predicting positives: compared to the actual facts, it notably produces mass false positives, which may indicate a lower level of generalizability. Moreover, there's no significant improvements from the kitchen sink model to the feature engineered model, suggesting that feature engineering still needs further optimization. Additionally, the training dataset is unbalanced, having too many negative samples while having only a few positives, which is not representative enough, and makes the prediction unreliable.
+ 
+Due to these reasons, I would less likely to recommend this regression model for production use, but I will suggest that the model can be considered as a reference in fitting suitable model for further practice, since it has a pretty good performance in predicting positives.

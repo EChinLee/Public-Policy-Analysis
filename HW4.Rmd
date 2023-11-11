@@ -1,0 +1,655 @@
+---
+title: "Predictive Policing"
+subtitle: "Robbery Prediction Model in Chicago"
+author: "E Chin Li"
+date: "`10/15/2023`"
+output:
+  html_document:
+    theme: simplex
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+    code_download: yes
+---
+# Introduction & Set up
+
+Chicago's crime rates have long been a subject of national and international concern and the city itself serves as a microcosm of urban crime challenges faced by major metropolitan areas worldwide. By examining the patterns and determinants of robbery in Chicago, the dynamics of criminal activities can be understood better, which provides valuable insights into broader issues such as social inequality, policing strategies, and community safety.
+
+Selection bias happen when places that have suffered from robbery incidents historically are likely to be predicted to have higher robbery rates than usual. This may due to complicated reasons. Using a dataset for specific year for analysis can introduce bias, as robbery patterns can vary over time. If the chosen period doesn't capture these variations, the study results may not be generalizable. Other factors like the survivorship bias in data recording may also result in selection bias in modeling. The bias can lead to an underestimation or overestimation of the risk of robbery in certain areas, which can lead to an incomplete and potentially skewed understanding of the factors contributing to robbery and its spatial or temporal patterns in Chicago. Furthermore, public policy and law enforcement strategies may be misinformed if selection bias leads to inaccurate insights into high-risk areas or demographics.
+
+$All data resource from Chicago Open Data site (https://data.cityofchicago.org/).$
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat.explore)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(classInt)   # for KDE and ML risk class intervals
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+# Data Wrangling
+
+## Base Data
+
+### Loading and Visualizing Chicago Data
+
+Base data are about the geographic and crime data in Chicago. Point plot and density plot are used fot the visualization of police districts, police beats, Chicago city boundary, and robbery data as follows.
+```{r dataloading, results = 'hide'}
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+  
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+robbery <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2020/qzdf-xmn8") %>% 
+    filter(Primary.Type == "ROBBERY" & Description == "ARMED - HANDGUN") %>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+```
+
+```{r robbery, fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = robbery, colour="#c44536", size=0.1, show.legend = "point") +
+  labs(title= "Robbery",
+       subtitle = "Chicago - 2020") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey80") +
+  stat_density2d(data = data.frame(st_coordinates(robbery)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Robbery",
+       subtitle = "Chicago - 2020") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+```
+
+### Robbery Fishnet Plot
+
+Robbery fishnet plot has been created according to the robbery data. It can be seen clearly that most robberies happen in the northwest and south of the city.
+```{r robbery fishnet, message=FALSE, warning=FALSE}
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            
+  st_sf() %>%
+  mutate(uniqueID = 1:n())
+
+crime_net <- 
+  dplyr::select(robbery) %>% 
+  mutate(countRobbery = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countRobbery = replace_na(countRobbery, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countRobbery), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Count of Robbery for the Fishnet",
+       subtitle = "Chicago - 2020") +
+  mapTheme()
+
+```
+
+## Additional Spatial Features
+
+### Adding Other Spatial Features
+
+Spatial features such as abandoned cars, abandoned buildings, shot spotter alerts, street lights condition, and traffic crash are selected to explore the relationship of these city features and crime rate.
+```{r features, results = 'hide'}
+
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Cars")
+
+abandonBuildings <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+    mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Buildings")
+
+shotspotterAlerts <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Violence-Reduction-Shotspotter-Alerts/3h7q-7mdb") %>%
+    mutate(year = substr(date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Shotspotter_Alerts")
+
+streetlightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Street_Lights_Out")
+
+TrafficCrash <- 
+  read.socrata("https://data.cityofchicago.org/Transportation/Traffic-Crashes-Crashes/85ca-t3if") %>%
+  mutate(year = substr(crash_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Traffic_Crash")
+
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+
+```
+
+### Fishnet Risk Features
+
+Fishnet plots are also used to show the distribution and density of the spatial features. Most abandoned buildings concentrate in the southern part of Chicago, and others are in the northwest. The shot spotter alert has similar distribution, but the coverage is much smaller. Most abandoned cars are in north and west, and there's no clear trend of street lights out shown in the plot. The distributions of both abandoned cars and street lights out are more scattered compared to the former two features.
+```{r fishnet risk features, message=FALSE, warning=FALSE}
+
+vars_net <- 
+  rbind(abandonCars, abandonBuildings, streetlightsOut, shotspotterAlerts, TrafficCrash) %>%
+  st_join(fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  left_join(fishnet, ., by = "uniqueID") %>%
+  spread(Legend, count, fill=0) %>%
+  dplyr::select(-`<NA>`) %>%
+  na.omit() %>%
+  ungroup()
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3,nrow=2, top="Risk Factors by Fishnet"))
+
+```
+
+### Nearest Neighbor Features
+
+By doing the nearest neighbor calculation, the distance of the nearest three features of each type can be visualized as follows. These results serve as important independent variables in the regression model.
+```{r nn features, message=FALSE, warning=FALSE}
+
+st_c    <- st_coordinates
+st_coid <- st_centroid
+
+vars_net <- vars_net %>%
+    mutate(Abandoned_Cars.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(abandonCars),
+                                           k = 3),
+           Abandoned_Buildings.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(abandonBuildings),
+                                           k = 3),
+           Street_Lights_Out.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(streetlightsOut),
+                                           k = 3),
+           Shot_Spotter_Alerts.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(shotspotterAlerts),
+                                           k = 3),
+           Traffic_Crash.nn = nn_function(st_c(st_coid(vars_net)),
+                                          na.omit(st_c(TrafficCrash)),
+                                          k = 3)
+           )
+
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+    gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+    scale_fill_viridis(name="") +
+    labs(title=i) +
+    mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol = 3, top = "Nearest Neighbor risk Features by Fishnet"))
+```
+
+## Join NN feature to our fishnet & Join in areal data
+
+The following map shows the distribution of districts in Chicago.
+```{r join nn feature, message=FALSE, warning=FALSE}
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+final_net <-
+  st_centroid(final_net) %>%
+    st_join(dplyr::select(neighborhoods, name), by = "uniqueID") %>%
+    st_join(dplyr::select(policeDistricts, District), by = "uniqueID") %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+      st_sf() %>%
+  na.omit()
+
+mapview::mapview(final_net, zcol = "District")
+```
+
+# Spatial Correlation
+
+## Local Moran's I 
+
+Local Moran’s I is calculated and the hotspots of robbery are identified according to the Moran’s I result. It can be seen from the plot below that there are some small significant clusters of robberies in Northwest and South Chicago. This again point out the importance to account for spatial features when predicting the robbery pattern.
+```{r moran, warning=FALSE}
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+
+local_morans <- localmoran(final_net$countRobbery, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Robbery_count = countRobbery, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+
+vars <- unique(final_net.localMorans$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(final_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(mapList, ncol = 2, top = "Local Morans I statistics, Robbery"))
+  
+```
+
+## Correlations Scatterplots and Histogram of Robbery Counts
+
+The correlation test results are shown as follows. Some predictors, like abandoned buildings, shot spotter alerts, and traffic crash show moderate correlations, while the relationship of other features, like abandoned cars, with dependent variable seem to be weak. Meanwhile, the correlation of spatial features are positive, while the relationship between robbery and nearest neighbor features are negative.
+
+The following histogram shows the distribution of robberies, which is like Poisson distribution.
+```{r scatter plot and histogram, fig.height=8, fig.width=11, message=FALSE, warning=FALSE}
+
+correlation_long <- 
+  st_drop_geometry(final_net)%>% 
+  dplyr::select(-uniqueID, -cvID, -name, -District) %>%
+  pivot_longer(cols = -countRobbery, # everything except measurement
+               names_to = "Type", # categorizes all quantitative variables into Type
+               values_to = "Number") # the name of values is Number
+
+ correlation_long %>%
+  ggplot(aes(x= Number, y = countRobbery)) +
+  geom_point(size = 0.1, color = "#283d3b") +  
+  geom_smooth(method='lm', formula= y~x, lwd=0.5, color = "#c44536") +
+  facet_wrap(~ Type, scales = "free", labeller= labeller(Type = c(
+    `Abandoned_Buildings` = "Abandoned Buildings",
+    `Abandoned_Cars` = "Abandoned Cars",
+    `Shotspotter_Alerts` = "Shotspotter Alerts",
+    `Street_Lights_Out` = "Streetlights Out",
+    `Traffic_Crash` = "Traffic Crash",
+    `Abandoned_Buildings.nn` = "Abandoned Buildings.nn",
+    `Abandoned_Cars.nn` = "Abandoned Cars.nn",
+    `Shot_Spotter_Alerts.nn` = "Shotspotter Alerts.nn",
+    `Street_Lights_Out.nn` = "Streetlights Out.nn",
+    `Traffic_Crash.nn` = "Traffic Crash.nn"
+    )))  +
+  labs(title = "Scatter Plot of Robbery over Risk Features") +
+  plotTheme()
+ 
+ ggplot(correlation_long, aes(x = countRobbery)) +
+  geom_histogram(binwidth = 1, fill = "#c44536", color = "#283d3b") +
+  labs(
+    title = "Histogram of Robbery Counts",
+    x = "Robbery Counts",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+```
+
+## Distance to Hot spot
+
+Below is the distance to hotspot plot.
+```{r distance to hot spot, message=FALSE, warning=FALSE}
+
+final_net <- final_net %>% 
+  mutate(robbery.isSig = 
+           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+  mutate(robbery.isSig.dist = 
+           nn_function(st_c(st_coid(final_net)),
+                       st_c(st_coid(filter(final_net,
+                                           robbery.isSig == 1))), 
+                       k = 1))
+
+ggplot() +
+      geom_sf(data = final_net, aes(fill=robbery.isSig.dist), colour=NA) +
+      scale_fill_viridis(name="NN Distance") +
+      labs(title="Robbery NN Distance") +
+      mapTheme()
+```
+
+## Modeling
+
+### Fold and Spatial Regression
+
+Just risk factors list contains only spatial variables, such as abandoned cars, abandoned buildings, shot spotter alerts, and street lights out. Based on this, spatial process list contains additional crimehotspots like `robbery.isSig` and `robbery.isSig.dist`. Flod and spatial regressions are done using these variable lists.
+```{r fold and spatial regression, results = 'hide'}
+reg.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Street_Lights_Out.nn", "Traffic_Crash.nn", "Shot_Spotter_Alerts.nn")
+
+reg.ss.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Street_Lights_Out.nn", "Traffic_Crash.nn", "Shot_Spotter_Alerts.nn", "robbery.isSig", "robbery.isSig.dist")
+
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countRobbery",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = cvID, countRobbery, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countRobbery",
+  indVariables = reg.ss.vars) %>%
+  dplyr::select(cvID = cvID, countRobbery, Prediction, geometry)
+
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countRobbery",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = name, countRobbery, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",                           
+  dependentVariable = "countRobbery",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countRobbery, Prediction, geometry)
+
+reg.summary <- 
+  rbind(
+    mutate(reg.cv, Error = Prediction - countRobbery,
+           Regression = "Random k-fold CV: Just Risk Factors"),
+    mutate(reg.ss.cv, Error = Prediction - countRobbery,
+           Regression = "Random k-fold CV: Spatial Process"),
+    mutate(reg.spatialCV, Error = Prediction - countRobbery,
+           Regression = "Spatial LOGO-CV: Just Risk Factors"),
+    mutate(reg.ss.spatialCV, Error = Prediction - countRobbery,
+           Regression = "Spatial LOGO-CV: Spatial Process")
+  ) %>% 
+  st_sf()
+
+```
+
+### Calculating Errors across space
+
+The accuracy of the regression model is measured. Mean error, MAE, and SD MAE are shown in the maps, plots, and table below. It can be concluded that random k-fold model functions better than spatial LOGO model, and it seems that in the random k-fold model, spatial process model works more accurate than just risk factors model.
+```{r error across space, message=FALSE, warning=FALSE}
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(cvID, Regression) %>% 
+    summarize(Mean_Error = mean(Prediction - countRobbery, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+     ungroup()
+
+
+vars <- unique(error_by_reg_and_fold$Regression)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(error_by_reg_and_fold, Regression == i), aes(fill=MAE), colour=NA) +
+    scale_fill_viridis(name="") +
+    labs(title=i, size = 10) +
+    mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol = 2, top = "MAE by Fold and Regression"))
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+  geom_histogram(bins = 30, colour="#283d3b", fill = "#c44536") +
+  facet_wrap(~Regression) +  
+  geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+  labs(title="Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+       x="Mean Absolute Error", y="Count") +
+  plotTheme()
+
+ error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression) %>% 
+    summarize(Mean_Error = mean(Prediction - countRobbery, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+     ungroup()
+ 
+ error_by_reg_and_fold %>% 
+ st_drop_geometry() %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))  %>% 
+  row_spec(2, color = "#283d3b", background = "#e9ecef") %>%
+  row_spec(4, color = "#283d3b", background = "#e9ecef") 
+ 
+```
+
+## Errors by Race
+
+The raw errors of model in race type are shown in the following table. Random k-fold model still performs better than spatial LOGO model in both majority white and majority non-white regions. However, the error of spatial process model is very close to just risk factors model in the comparison.
+
+All the models show difference between majority white and majority non-whit in error. Compared to model with just risk factors, the errors of two regions are relevantly close to each other in model with spatial process, which may indicate a better generalizability.
+```{r get acs, include=FALSE}
+census_api_key("ee5bb303d562a134a5fc2cdbc4ab53c8d0ca7629", overwrite = TRUE)
+
+tracts17 <- 
+  get_acs(geography = "tract", 
+          variables = c("B02001_001E", # total population
+            "B02001_002E" ),  # white population
+          year=2017, state=17, county=31, 
+          geometry=TRUE, output="wide") %>%
+  st_transform('ESRI:102271') %>% 
+  rename(TotalPop = B02001_001E, 
+         White = B02001_002E) %>% 
+  mutate(pctWhite = White/TotalPop , 
+         Race = ifelse(pctWhite > 0.5, "MajorityWhite", "MajorityNonWhite")) %>% 
+    .[neighborhoods,]
+```
+
+```{r error by race, message=FALSE, warning=FALSE}
+
+reg.summary %>% 
+  st_centroid() %>% 
+  st_join(tracts17) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, Race) %>%
+  summarize(mean.Error = mean(Error, na.rm = T)) %>%
+  spread(Race, mean.Error) %>%
+  kable(caption = "Mean Error by neighborhood racial context") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))  %>% 
+  row_spec(2, color = "#283d3b", background = "#e9ecef") %>%
+  row_spec(4, color = "#283d3b", background = "#e9ecef") 
+
+```
+
+# Density vs predictions
+
+The following plot is the kernel density of robberies in 2017. The regions with high kernel density have a higher probability of robberies in the next year.
+```{r 2017 robbery, message=FALSE, warning=FALSE}
+rob_ppp <- as.ppp(st_coordinates(robbery), W = st_bbox(final_net))
+rob_KD.1000 <- spatstat.explore::density.ppp(rob_ppp, 1000)
+
+rob_KD.df <- rbind(
+  mutate(data.frame(rasterToPoints(mask(raster(rob_KD.1000), as(neighborhoods, 'Spatial')))), Legend = "1000 Ft.")) 
+
+rob_KD.df$Legend <- factor(rob_KD.df$Legend, levels = c("1000 Ft."))
+
+as.data.frame(rob_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+   ggplot() +
+     geom_sf(aes(fill=value)) +
+     geom_sf(data = sample_n(robbery, 1500), size = .5, color = "#283d3b") +
+     scale_fill_viridis(name = "Density") +
+     labs(title = "Kernel Density of 2020 Robbery") +
+     mapTheme(title_size = 14)
+
+```
+Compared to prediction made by kernel density analysis, the regression model makes a more accurate prediction on the geographic level. Regression model works more precisely in most parts of the city, especially the southern part, but seems to underestimate the robbery rank in north Chicago at the same time. Meanwhile, the result of kernel density analysis is more reliable in northeast area, where regression model fails to rank a higher level of robbery possibility.
+```{r KD and Prediction, message=FALSE, warning=FALSE}
+robbery21 <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2021/dwme-t96c") %>% 
+  filter(Primary.Type == "ROBBERY" & Description == "ARMED - HANDGUN") %>%
+  mutate(x = gsub("[()]", "", Location)) %>%
+  separate(x,into= c("Y","X"), sep=",") %>%
+  mutate(X = as.numeric(X),
+         Y = as.numeric(Y)) %>% 
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102271') %>% 
+  distinct() %>%
+  .[fishnet,]
+
+rob_KDE_sum <- as.data.frame(rob_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) 
+kde_breaks <- classIntervals(rob_KDE_sum$value, 
+                             n = 5, "fisher")
+rob_KDE_sf <- rob_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = classInt::findCols(kde_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(robbery21) %>% mutate(robberyCount = 1), ., sum) %>%
+    mutate(robberyCount = replace_na(robberyCount, 0))) %>%
+  dplyr::select(label, Risk_Category, robberyCount)
+
+
+ml_breaks <- classIntervals(reg.ss.spatialCV$Prediction, 
+                             n = 5, "fisher")
+rob_risk_sf <-
+  reg.ss.spatialCV %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category =classInt::findCols(ml_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate( 
+      dplyr::select(robbery21) %>% mutate(robberyCount = 1), ., sum) %>%
+      mutate(robberyCount = replace_na(robberyCount, 0))) %>%
+  dplyr::select(label,Risk_Category, robberyCount)
+
+
+rbind(rob_KDE_sf, rob_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(robbery21, 3000, replace = TRUE), size = .5, colour = "#283d3b") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2020 robbery risk predictions; 2021 robbery") +
+    mapTheme(title_size = 14)
+```
+As can be seen in the chart below, there's a significant difference between the result produced by kernel density analysis and the prediction made regression model. Kernel density analysis predicts more cases in high rank groups (3rd, 4th and 5th), especially in the 4th rank, while regression model predicts more cases in low rank groups (1st and 2nd), especially in the 1st rank. In general, kernel density analysis predicts a increase trend in robbery cases and coverage, as regression model suggests there should be a declined trend in 2021 on the contrary.
+```{r histgram, message=FALSE, warning=FALSE}
+rbind(rob_KDE_sf, rob_risk_sf) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countRobbery = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countRobbery / sum(countRobbery)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE, name = "Model") +
+      labs(title = "Risk prediction vs. Kernel density, 2021 robbery",
+           y = "% of Test Set Robbery (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+# Conclusion
+
+In this project, geospatial features are examined and included in the risk regression model to reveal the relationship between spatial features and the crime attempts, especially robbery, in Chicago. Although the predictions made by the model may not be precise enough in some particular areas, this projection can explain the current crime pattern in Chicago to some extent. 
+
+However, I will probably not recommend the regression model for production use. Firstly, taking the future prediction as an example, the performance of the regression model is not ideal in northern part of Chicago: compared to kernel density analysis, it notably underestimates robberies in the northeast. Moreover, the MAE and the standard deviation of MAE are too small, which may indicate that the regression model is overfitting. This will result in the decrease in generalizability, and thus producing more errors in prediction. Additionally, the selected independent variables can only partly represent some factors driving robberies in Chicago. Other economic and demographic factors are dismissed in this model, leading to an incomprehensive interpretation of robberies. Furthermore, the base dataset is only about 2017, which is not representative enough, and more data about other years should be taken into consideration to produce a more reliable model. 
+
+Due to these reasons, I would less likely to recommend this regression model for production use, but I will suggest that the model can be considered as a reference in fitting suitable model for police practice, since some variables in the regression model show significant relationships with robberies and the model makes a well prediction in some parts of Chicago in prediction.
